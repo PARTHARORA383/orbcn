@@ -1,34 +1,52 @@
 'use client';
 
 import { Canvas, useFrame } from '@react-three/fiber';
-import { useMemo, useRef } from 'react';
+import { useMemo, useRef, useEffect } from 'react';
 import * as THREE from 'three';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 export type OrbState = 'idle' | 'listening' | 'speaking';
 
-interface ShaderSceneProps {
+export interface OrbConfig {
+  flowX?: number;
+  flowY?: number;
+  flowXSpeed?: number;
+  speed?: number;
+  warpStrength?: number;
+
+  // Any number of hex colors, 1–16. Evenly distributed across the gradient.
+  colors?: string[];
+
+  ribbonOpacityCap?: number;
+  ribbonBreatheAmp?: number;
+  ribbonBreatheSpeed?: number;
+  grainAmount?: number;
   state?: OrbState;
 }
 
-// ─── Speed map ────────────────────────────────────────────────────────────────
-const SPEED: Record<OrbState, number> = {
-  idle:      0.06,   // barely drifting
-  listening: 0.14,   // gently alive
-  speaking:  0.28,   // flowing water, not frantic
-};
+// Resolved config — all fields required, colors always a string[]
+interface ResolvedConfig extends Required<Omit<OrbConfig, 'colors'>> {
+  colors: string[];
+}
 
-const WARP: Record<OrbState, number> = {
-  idle:      0.28,
-  listening: 0.38,
-  speaking:  0.50,
-};
+export const DEFAULT_COLORS: string[] = [
+  '#7B78E5',
+  '#9D8FEF',
+  '#B89BE8',
+  '#D4A0C8',
+  '#E8A898',
+  '#F2BC88',
+  '#F5D07A',
+];
 
-// ─── Simplex Noise (Ashima Arts / Stefan Gustavson) ───────────────────────────
+// GLSL array size — compile-time constant. Supports 1–16 stops.
+const MAX_COLORS = 16;
+
+// ─── Simplex Noise ────────────────────────────────────────────────────────────
 const simplexNoise = `
-vec3 mod289(vec3 x){ return x - floor(x * (1.0/289.0)) * 289.0; }
-vec4 mod289(vec4 x){ return x - floor(x * (1.0/289.0)) * 289.0; }
-vec4 permute(vec4 x){ return mod289(((x*34.0)+1.0)*x); }
+vec3 mod289v3(vec3 x){ return x - floor(x*(1.0/289.0))*289.0; }
+vec4 mod289v4(vec4 x){ return x - floor(x*(1.0/289.0))*289.0; }
+vec4 permute(vec4 x){ return mod289v4(((x*34.0)+1.0)*x); }
 vec4 taylorInvSqrt(vec4 r){ return 1.79284291400159 - 0.85373472095314*r; }
 
 float snoise(vec3 v){
@@ -43,7 +61,7 @@ float snoise(vec3 v){
   vec3 x1 = x0 - i1 + C.xxx;
   vec3 x2 = x0 - i2 + C.yyy;
   vec3 x3 = x0 - D.yyy;
-  i = mod289(i);
+  i = mod289v3(i);
   vec4 p = permute(permute(permute(
     i.z + vec4(0.0, i1.z, i2.z, 1.0))
   + i.y + vec4(0.0, i1.y, i2.y, 1.0))
@@ -75,7 +93,6 @@ float snoise(vec3 v){
 }
 `;
 
-// ─── FBM + Flow Field ─────────────────────────────────────────────────────────
 const fbmGlsl = `
 ${simplexNoise}
 
@@ -97,14 +114,13 @@ float fbm(vec3 p){
   return value;
 }
 
-vec2 flowField(vec2 uv, float time){
-  float x = fbm(vec3(uv * 2.5,       time));
-  float y = fbm(vec3(uv * 2.5 + 8.3, time));
+vec2 flowField(vec2 uv, float t){
+  float x = fbm(vec3(uv * 2.5,       t));
+  float y = fbm(vec3(uv * 2.5 + 8.3, t));
   return vec2(x, y);
 }
 `;
 
-// ─── Vertex Shader ────────────────────────────────────────────────────────────
 const vertexShader = `
 varying vec2 vUv;
 void main(){
@@ -113,117 +129,280 @@ void main(){
 }
 `;
 
-// ─── Fragment Shader ──────────────────────────────────────────────────────────
 const fragmentShader = `
+#define MAX_COLORS ${MAX_COLORS}
+
 uniform float uTime;
+uniform float uFlowX;
+uniform float uFlowY;
 uniform float uWarp;
-uniform vec3  uColor1;
-uniform vec3  uColor2;
-uniform vec3  uColor3;
-uniform vec3  uColor4;
-uniform vec3  uColor5;
-uniform vec3  uColor6;
-uniform vec3  uColor7;
+uniform float uRibbonOpacityCap;
+uniform float uRibbonBreatheAmp;
+uniform float uRibbonBreatheSpeed;
+uniform float uGrainAmount;
+uniform vec3  uColors[MAX_COLORS];
+uniform int   uColorCount;
+uniform float uSpeaking;
 
 varying vec2 vUv;
 
 ${fbmGlsl}
 
 vec3 gradientColor(float t){
-  vec3 c = uColor1;
-  c = mix(c, uColor2, smoothstep(0.00, 0.18, t));
-  c = mix(c, uColor3, smoothstep(0.16, 0.34, t));
-  c = mix(c, uColor4, smoothstep(0.32, 0.50, t));
-  c = mix(c, uColor5, smoothstep(0.48, 0.66, t));
-  c = mix(c, uColor6, smoothstep(0.64, 0.82, t));
-  c = mix(c, uColor7, smoothstep(0.80, 1.00, t));
-  return c;
+  vec3 color = uColors[0];
+  for(int i = 1; i < MAX_COLORS; i++){
+    if(i >= uColorCount) break;
+    float stopT = float(i) / float(uColorCount - 1);
+    float prevT = float(i - 1) / float(uColorCount - 1);
+    color = mix(color, uColors[i], smoothstep(prevT, stopT, t));
+  }
+  return color;
+}
+
+float grain(vec2 uv, float time){
+  return fract(sin(dot(uv * 200.0 + time * 0.3, vec2(127.1, 311.7))) * 43758.5453);
+}
+
+float ribbonLayer(vec2 centered, vec2 flowDisp, float t, float orbitSpeed, vec2 fbmOffset, float fbmScale, float timeScale){
+  float angle = t * orbitSpeed;
+  float ca = cos(angle), sa = sin(angle);
+  vec2 orbited = vec2(centered.x*ca - centered.y*sa, centered.x*sa + centered.y*ca);
+  vec2 distorted = orbited + flowDisp * 0.28;
+  float n = fbm(vec3((distorted + fbmOffset) * fbmScale, t * timeScale));
+  return smoothstep(0.30, 0.74, n * 0.5 + 0.5);
+}
+
+float sweepArc(vec2 c, float t, float speed, float phase, float width, float noiseAmt) {
+  float angle = atan(c.y, c.x);
+  float r = length(c);
+  float edgeFade = smoothstep(0.08, 0.42, r) * smoothstep(0.52, 0.38, r);
+  float arcCenter = mod(t * speed + phase, 6.28318);
+  float diff = abs(mod(angle - arcCenter + 9.42478, 6.28318) - 3.14159);
+  float n = fbm(vec3(c * 3.5, t * 0.8 + phase)) * noiseAmt;
+  float arc = smoothstep(width + n, width * 0.1 + n, diff);
+  return arc * edgeFade;
+}
+
+mat3 rotationY(float a){ float c = cos(a); float s = sin(a); return mat3(c,0.,s, 0.,1.,0., -s,0.,c); }
+mat3 rotationX(float a){ float c = cos(a); float s = sin(a); return mat3(1.,0.,0., 0.,c,-s, 0.,s,c); }
+
+float shellBand(vec3 p,float t){
+    p = rotationY(t*0.18) * rotationX(sin(t*0.3)*0.25) * p;
+    vec3 q = p;
+    q += vec3(fbm(vec3(p.xy*3.0,t*0.25)), fbm(vec3(p.yz*3.0,t*0.23)), fbm(vec3(p.zx*3.0,t*0.27)))*0.18;
+    float d = abs(q.y + q.x*0.35);
+    float outer = exp(-d*2.5);
+    float middle = exp(-d*6.0);
+    float core = exp(-d*18.0);
+    float mask = outer*0.18 + middle*0.42 + core*0.75;
+    mask *= smoothstep(-0.95,-0.2,q.z);
+    mask *= 1.0-smoothstep(0.35,0.95,q.z);
+    return clamp(mask,0.0,1.0);
 }
 
 void main(){
-  vec2 uv = vUv;
+  vec2 uv = vec2(vUv.x + uFlowX, vUv.y + uFlowY);
+  vec2 centered = uv - 0.5;
+  vec2 flow = flowField(centered, uTime);
+  vec2 uv2 = centered + flow * uWarp * 1.4;
+  vec2 flow2 = flowField(uv2, uTime + 3.7);
+  vec2 warped = centered + flow * uWarp + flow2 * (uWarp * 0.6);
+  float diag = (centered.x * 0.7071 + centered.y * 0.7071) * 0.9 + 0.5;
+  float warpedDiag = (warped.x * 0.7071 + warped.y * 0.7071) * 0.9 + 0.5;
+  float perp = (-centered.x * 0.7071 + centered.y * 0.7071);
+  float wave1 = sin(perp * 5.0 - uTime * 0.6) * 0.04;
+  float wave2 = sin(perp * 3.2 - uTime * 0.42 + 1.3) * 0.02;
+  float noiseDisplace = fbm(vec3(uv * 2.2, uTime * 2.0)) * 0.10;
+  float rawGt = mix(diag, warpedDiag, 0.6) + wave1 + wave2 + noiseDisplace;
+  float gt = abs(fract(rawGt * 0.5) * 2.0 - 1.0);
+  vec3 color = gradientColor(gt);
 
-  vec2 flow  = flowField(uv - 0.5, uTime);
-  vec2 uv2   = uv + flow * uWarp * 1.4;
-  vec2 flow2 = flowField(uv2 - 0.5, uTime + 3.7);
-  vec2 warped = uv + flow * uWarp + flow2 * (uWarp * 0.6);
+  vec2 ribbonFlow = flow * 0.25;
+  float mA = ribbonLayer(centered, ribbonFlow, uTime, 0.09, vec2(0.0, 0.0), 1.6, 0.12);
+  float mB = ribbonLayer(centered, ribbonFlow, uTime, -0.13, vec2(3.7, 1.9), 1.4, 0.09);
+  float mC = ribbonLayer(centered, ribbonFlow, uTime, 0.07, vec2(7.2, -2.4), 1.9, 0.16);
+  float ribbonMask = clamp(mA * 0.65 + mB * 0.55 + mC * 0.35, 0.0, 1.0);
+  float breathe = 0.50 + uRibbonBreatheAmp * sin(uTime * uRibbonBreatheSpeed) + 0.15 * sin(uTime * 0.57 + 1.4);
+  color = mix(color, vec3(1.0), clamp(ribbonMask * breathe, 0.0, uRibbonOpacityCap));
 
-  float ty = clamp(warped.y, 0.0, 1.0);
-  float t  = ty;
+  if(uSpeaking > 0.001){
+    float s1 = sweepArc(centered, uTime, 2.8, 0.00, 0.55, 0.18);
+    float s2 = sweepArc(centered, uTime, 1.9, 2.09, 0.38, 0.22);
+    float s3 = sweepArc(centered, uTime, 3.5, 4.19, 0.28, 0.14);
+    float s4 = sweepArc(centered, uTime, 1.1, 1.05, 0.90, 0.30) * 0.4;
+    float sweep = clamp(s1 * 0.85 + s2 * 0.70 + s3 * 0.60 + s4, 0.0, 1.0);
+    vec3 sweepColor = vec3(1.0, 0.98, 0.96);
+    color = mix(color, sweepColor, sweep * uSpeaking * 0.82);
+  }
 
-  vec3 color = gradientColor(t);
-  color += 0.05 * length(flow);
+  float g = grain(vUv, uTime) * uGrainAmount;
+  color += g - uGrainAmount * 0.5;
 
-  gl_FragColor = vec4(color, 1.0);
+  gl_FragColor = vec4(clamp(color, 0.0, 1.0), 1.0);
+
+  vec2 sphereUV = vUv * 2.0 - 1.0;
+  float rr = dot(sphereUV,sphereUV);
+  if(rr <= 1.0){
+    float z = sqrt(1.0 - rr);
+    vec3 normal = normalize(vec3(sphereUV,z));
+    float shell = shellBand(normal,uTime);
+    float shellBreathe = 0.75 + 0.25*sin(uTime*0.55);
+    shell *= shellBreathe;
+    float fresnel = pow(1.0-normal.z,3.0);
+    shell += fresnel*0.22;
+    shell = clamp(shell,0.0,1.0);
+    vec3 shellColor = vec3(1.0);
+    color = mix(color, shellColor, shell*0.28);
+  }
 }
 `;
 
-// ─── Material ────────────────────────────────────────────────────────────────
-interface GradientMaterialProps {
-  orbState: OrbState;
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function colorsToFloat32(hexColors: string[]): Float32Array {
+  const arr = new Float32Array(MAX_COLORS * 3);
+  const tmp = new THREE.Color();
+  hexColors.forEach((hex, i) => {
+    if (i >= MAX_COLORS) return;
+    tmp.set(hex);
+    arr[i * 3 + 0] = tmp.r;
+    arr[i * 3 + 1] = tmp.g;
+    arr[i * 3 + 2] = tmp.b;
+  });
+  return arr;
 }
 
-function GradientMaterial({ orbState }: GradientMaterialProps) {
-  const material = useMemo(
-    () =>
-      new THREE.ShaderMaterial({
-        vertexShader,
-        fragmentShader,
-        uniforms: {
-          uTime:   { value: 0 },
-          uWarp:   { value: WARP.idle },
-          // Screenshot-matched palette: lavender → purple → mauve → rose → peach → sand
-          uColor1: { value: new THREE.Color('#7B78E5') }, // periwinkle
-          uColor2: { value: new THREE.Color('#9D8FEF') }, // soft violet
-          uColor3: { value: new THREE.Color('#B89BE8') }, // lavender
-          uColor4: { value: new THREE.Color('#D4A0C8') }, // mauve
-          uColor5: { value: new THREE.Color('#E8A898') }, // rose
-          uColor6: { value: new THREE.Color('#F2BC88') }, // peach
-          uColor7: { value: new THREE.Color('#F5D07A') }, // warm sand
-        },
-      }),
-    []
-  );
+// ─── Inner material ───────────────────────────────────────────────────────────
+interface MaterialProps {
+  configRef: React.MutableRefObject<ResolvedConfig>;
+}
 
-  // Accumulate time scaled by current speed — avoids the jump when speed changes
-  const currentSpeed = useRef(SPEED.idle);
-  const currentWarp  = useRef(WARP.idle);
-  const scaledTime   = useRef(0);
+function GradientMaterial({ configRef }: MaterialProps) {
+  // Track speaking opacity separately for smooth fade
+  const speakingRef = useRef(0);
+
+  const material = useMemo(() => {
+    const cfg = configRef.current;
+    return new THREE.ShaderMaterial({
+      vertexShader,
+      fragmentShader,
+      uniforms: {
+        uTime:               { value: 0 },
+        uFlowX:              { value: 0 },
+        uFlowY:              { value: 0 },
+        uWarp:               { value: cfg.warpStrength },
+        uRibbonOpacityCap:   { value: cfg.ribbonOpacityCap },
+        uRibbonBreatheAmp:   { value: cfg.ribbonBreatheAmp },
+        uRibbonBreatheSpeed: { value: cfg.ribbonBreatheSpeed },
+        uGrainAmount:        { value: cfg.grainAmount },
+        uColors:             { value: colorsToFloat32(cfg.colors) },
+        uColorCount:         { value: Math.min(cfg.colors.length, MAX_COLORS) },
+        uSpeaking:           { value: 0 },
+      },
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useFrame((_, delta) => {
-    const targetSpeed = SPEED[orbState];
-    const targetWarp  = WARP[orbState];
-    const lerpFactor  = 1 - Math.exp(-delta * 2.5);
+    const cfg = configRef.current;
+    const dt  = Math.min(delta, 0.1);
 
-    currentSpeed.current += (targetSpeed - currentSpeed.current) * lerpFactor;
-    currentWarp.current  += (targetWarp  - currentWarp.current)  * lerpFactor;
+    material.uniforms.uTime.value += dt * cfg.speed;
+    material.uniforms.uFlowX.value =
+      Math.sin(material.uniforms.uTime.value * cfg.flowXSpeed) * cfg.flowX;
+    material.uniforms.uFlowY.value =
+      Math.sin(material.uniforms.uTime.value * cfg.flowXSpeed * 0.7 + 1.2) * cfg.flowY;
 
-    // Time advances by delta * speed each frame — no sudden jumps on state change
-    scaledTime.current += delta * currentSpeed.current;
+    material.uniforms.uWarp.value               = cfg.warpStrength;
+    material.uniforms.uRibbonOpacityCap.value   = cfg.ribbonOpacityCap;
+    material.uniforms.uRibbonBreatheAmp.value   = cfg.ribbonBreatheAmp;
+    material.uniforms.uRibbonBreatheSpeed.value = cfg.ribbonBreatheSpeed;
+    material.uniforms.uGrainAmount.value        = cfg.grainAmount;
 
-    material.uniforms.uTime.value = scaledTime.current;
-    material.uniforms.uWarp.value = currentWarp.current;
+    colorsToFloat32(cfg.colors).forEach((v, i) => {
+      (material.uniforms.uColors.value as Float32Array)[i] = v;
+    });
+    material.uniforms.uColorCount.value = Math.min(cfg.colors.length, MAX_COLORS);
+
+    // Smooth fade for speaking sweep — lerp toward 1 or 0
+    const target = cfg.state === 'speaking' ? 1 : 0;
+    speakingRef.current += (target - speakingRef.current) * dt * 3.0;
+    material.uniforms.uSpeaking.value = speakingRef.current;
   });
 
   return <primitive object={material} attach="material" />;
 }
 
-// ─── Orb ─────────────────────────────────────────────────────────────────────
-function ShaderOrb({ orbState }: { orbState: OrbState }) {
+
+// ─── Inner mesh for scaling ───────────────────────────────────────────────────
+interface AnimatedOrbProps {
+  configRef: React.MutableRefObject<ResolvedConfig>;
+}
+
+function AnimatedOrb({ configRef }: AnimatedOrbProps) {
+  const meshRef = useRef<THREE.Mesh>(null);
+  const scaleRef = useRef(1.0); // Internal state for smooth animation
+
+  useFrame((_, delta) => {
+    if (!meshRef.current) return;
+    const { state } = configRef.current;
+    const dt = Math.min(delta, 0.1);
+    
+    // Target scale: 0.85 when listening, 1.0 when idle or speaking
+    const target = state === 'listening' ? 0.85 : 1.0;
+    
+    // Physics-like lerp (spring effect)
+    scaleRef.current += (target - scaleRef.current) * dt * 8.0;
+    
+    // Apply to mesh
+    meshRef.current.scale.set(scaleRef.current, scaleRef.current, scaleRef.current);
+  });
+
   return (
-    <mesh>
+    <mesh ref={meshRef}>
       <sphereGeometry args={[1, 256, 256]} />
-      <GradientMaterial orbState={orbState} />
+      <GradientMaterial configRef={configRef} />
     </mesh>
   );
 }
 
-// ─── Scene ───────────────────────────────────────────────────────────────────
-export function ShaderScene({ state = 'idle' }: ShaderSceneProps) {
+// ─── Public component ─────────────────────────────────────────────────────────
+export function ShaderScene({
+  flowX              = 0.15,
+  flowY              = 0,
+  flowXSpeed         = 0.8,
+  speed              = 0.06,
+  warpStrength       = 0.28,
+  colors,
+  ribbonOpacityCap   = 0.52,
+  ribbonBreatheAmp   = 0.25,
+  ribbonBreatheSpeed = 0.31,
+  grainAmount        = 0.04,
+  state              = 'idle',
+}: OrbConfig) {
+  const resolvedColors = (colors && colors.length > 0) ? colors : DEFAULT_COLORS;
+
+  const configRef = useRef<ResolvedConfig>({
+    flowX, flowY, flowXSpeed, speed, warpStrength,
+    colors: resolvedColors,
+    ribbonOpacityCap, ribbonBreatheAmp, ribbonBreatheSpeed,
+    grainAmount, state,
+  });
+
+  useEffect(() => {
+    configRef.current = {
+      flowX, flowY, flowXSpeed, speed, warpStrength,
+      colors: resolvedColors,
+      ribbonOpacityCap, ribbonBreatheAmp, ribbonBreatheSpeed,
+      grainAmount, state,
+    };
+  });
+
   return (
     <Canvas camera={{ position: [0, 0, 3], fov: 45 }}>
       <ambientLight intensity={1} />
-      <ShaderOrb orbState={state} />
+      {/* Replaced static mesh with AnimatedOrb */}
+      <AnimatedOrb configRef={configRef} />
     </Canvas>
   );
 }

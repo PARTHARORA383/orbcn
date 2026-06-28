@@ -1,7 +1,7 @@
 'use client';
 
 import { Canvas, useFrame } from '@react-three/fiber';
-import { useMemo, useRef } from 'react';
+import { useMemo } from 'react';
 import * as THREE from 'three';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -12,6 +12,8 @@ interface ShaderSceneProps {
 }
 
 // ─── Simplex Noise ────────────────────────────────────────────────────────────
+// Pure math: 3D simplex noise. Returns float in [-1, 1].
+// Foundation for all organic movement. No animation here.
 const simplexNoise = `
 vec3 mod289v3(vec3 x){ return x - floor(x*(1.0/289.0))*289.0; }
 vec4 mod289v4(vec4 x){ return x - floor(x*(1.0/289.0))*289.0; }
@@ -63,6 +65,10 @@ float snoise(vec3 v){
 `;
 
 // ─── FBM + Flow Field ─────────────────────────────────────────────────────────
+// rotate2D  — rotates each FBM octave to prevent axis-aligned banding
+// fbm       — 5-octave Fractional Brownian Motion; creates layered organic texture
+// flowField — samples fbm at two UV offsets to produce a 2D displacement vector;
+//             this is what makes colors *flow* rather than sit still
 const fbmGlsl = `
 ${simplexNoise}
 
@@ -92,6 +98,8 @@ vec2 flowField(vec2 uv, float t){
 `;
 
 // ─── Vertex Shader ────────────────────────────────────────────────────────────
+// Minimal passthrough. Transforms vertices to clip space, forwards UVs.
+// Nothing interesting — just required boilerplate.
 const vertexShader = `
 varying vec2 vUv;
 void main(){
@@ -101,6 +109,12 @@ void main(){
 `;
 
 // ─── Fragment Shader ──────────────────────────────────────────────────────────
+// gradientColor(t) — maps t∈[0,1] → color across 7 stops via chained mix/smoothstep
+// grain(uv, time)  — film grain via sin hash, adds ±0.02 noise to final pixel
+// ribbonLayer(…)   — one white ribbon: rotates UV space, displaces by flow,
+//                    thresholds FBM with smoothstep → soft white streak
+// main()           — orchestrates: warp UVs → compute diagonal gt →
+//                    gradientColor → 3 ribbon layers → grain → output
 const fragmentShader = `
 uniform float uTime;
 uniform float uFlowX;
@@ -116,6 +130,8 @@ varying vec2 vUv;
 
 ${fbmGlsl}
 
+// Maps t∈[0,1] across 7 color uniforms with smooth transitions.
+// INPUT t drifting outside [0,1] was the root cause of color loss — now fixed below.
 vec3 gradientColor(float t){
   vec3 c = uColor1;
   c = mix(c, uColor2, smoothstep(0.00, 0.18, t));
@@ -127,10 +143,15 @@ vec3 gradientColor(float t){
   return c;
 }
 
+// Film grain: adds fine texture so the orb doesn't look plasticky.
 float grain(vec2 uv, float time){
   return fract(sin(dot(uv * 200.0 + time * 0.3, vec2(127.1, 311.7))) * 43758.5453);
 }
 
+// Produces one soft white ribbon:
+// 1. Orbit-rotates the UV space at orbitSpeed
+// 2. Displaces by flow vectors
+// 3. Samples FBM and smoothstep-thresholds it → a soft mask
 float ribbonLayer(
   vec2  centered,
   vec2  flowDisp,
@@ -152,29 +173,45 @@ float ribbonLayer(
 }
 
 void main(){
+  // FIX: uFlowX now oscillates (set from JS) rather than drifting forever,
+  // so we never escape the center of the UV space.
   vec2 uv       = vec2(vUv.x + uFlowX, vUv.y);
   vec2 centered = uv - 0.5;
 
   const float warp = 0.28;
 
+  // Double warp: flow → warp UV → sample flow again → warp again.
+  // Creates the swirling, layered liquid look.
   vec2 flow   = flowField(centered, uTime);
   vec2 uv2    = centered + flow * warp * 1.4;
   vec2 flow2  = flowField(uv2, uTime + 3.7);
   vec2 warped = centered + flow * warp + flow2 * (warp * 0.6);
 
+  // Diagonal projection: maps 2D position to gradient t value.
+  // "diag" is the raw position; "warpedDiag" is the flow-distorted version.
   float diag       = (centered.x * 0.7071 + centered.y * 0.7071) * 0.9 + 0.5;
   float warpedDiag = (warped.x   * 0.7071 + warped.y   * 0.7071) * 0.9 + 0.5;
 
+  // Perpendicular sine waves add gentle rippling across the gradient bands.
   float perp  = (-centered.x * 0.7071 + centered.y * 0.7071);
   float wave1 = sin(perp * 5.0 - uTime * 0.6) * 0.04;
   float wave2 = sin(perp * 3.2 - uTime * 0.42 + 1.3) * 0.02;
 
+  // FBM displacement nudges the gradient sampling point organically.
   float noiseDisplace = fbm(vec3(uv * 2.2, uTime * 2.0)) * 0.10;
 
-  float gt = clamp(mix(diag, warpedDiag, 0.6) + wave1 + wave2 + noiseDisplace, 0.0, 1.0);
+  // FIX: Instead of clamp(…, 0,1) which lets gt get stuck at 0 (all blue)
+  // or 1 (all gold), we ping-pong with abs(fract(…)*2-1).
+  // This means gt always bounces between 0→1→0→1, keeping ALL 7 colors alive
+  // regardless of how long the shader runs or how far UVs have drifted.
+  float rawGt = mix(diag, warpedDiag, 0.6) + wave1 + wave2 + noiseDisplace;
+  float gt    = abs(fract(rawGt * 0.5) * 2.0 - 1.0);
+
   vec3 color = gradientColor(gt);
 
-  // White ribbon
+  // Three ribbon layers composited together.
+  // Each has different orbit speed, FBM offset, scale, and time scale
+  // so they move independently and weave around each other.
   vec2 ribbonFlow = flow * 0.25;
   float mA = ribbonLayer(centered, ribbonFlow, uTime,  0.09, vec2(0.0,  0.0), 1.6, 0.12);
   float mB = ribbonLayer(centered, ribbonFlow, uTime, -0.13, vec2(3.7,  1.9), 1.4, 0.09);
@@ -182,11 +219,13 @@ void main(){
 
   float ribbonMask = clamp(mA * 0.65 + mB * 0.55 + mC * 0.35, 0.0, 1.0);
 
+  // Breathe: ribbon opacity pulses slowly at two frequencies for organic feel.
   float breathe = 0.50 + 0.25 * sin(uTime * 0.31) + 0.15 * sin(uTime * 0.57 + 1.4);
   float ribbonOpacity = ribbonMask * breathe;
 
   color = mix(color, vec3(1.0), clamp(ribbonOpacity, 0.0, 0.52));
 
+  // Film grain: subtle ±0.02 noise prevents banding on smooth gradients.
   float g = grain(vUv, uTime) * 0.04;
   color += g - 0.02;
 
@@ -194,7 +233,14 @@ void main(){
 }
 `;
 
-// ─── Material — always idle, state-blind ──────────────────────────────────────
+// ─── Material ─────────────────────────────────────────────────────────────────
+// Creates the ShaderMaterial with 7 color uniforms + uTime + uFlowX.
+//
+// useFrame tick (THE FIX IS HERE):
+//   uTime  += dt * 0.06       — slow, steady time advance for all animation
+//   uFlowX  = sin(uTime*0.8)  — oscillates ±0.15 instead of drifting to -∞
+//                               This keeps UV sampling centered on the sphere,
+//                               so the diagonal gradient always spans all 7 colors.
 function GradientMaterial() {
   const material = useMemo(
     () =>
@@ -204,13 +250,13 @@ function GradientMaterial() {
         uniforms: {
           uTime:   { value: 0 },
           uFlowX:  { value: 0 },
-          uColor1: { value: new THREE.Color('#7B78E5') },
-          uColor2: { value: new THREE.Color('#9D8FEF') },
-          uColor3: { value: new THREE.Color('#B89BE8') },
-          uColor4: { value: new THREE.Color('#D4A0C8') },
-          uColor5: { value: new THREE.Color('#E8A898') },
-          uColor6: { value: new THREE.Color('#F2BC88') },
-          uColor7: { value: new THREE.Color('#F5D07A') },
+          uColor1: { value: new THREE.Color('#7B78E5') }, // violet
+          uColor2: { value: new THREE.Color('#9D8FEF') }, // lavender
+          uColor3: { value: new THREE.Color('#B89BE8') }, // soft purple
+          uColor4: { value: new THREE.Color('#D4A0C8') }, // rose-pink
+          uColor5: { value: new THREE.Color('#E8A898') }, // salmon
+          uColor6: { value: new THREE.Color('#F2BC88') }, // amber
+          uColor7: { value: new THREE.Color('#F5D07A') }, // gold
         },
       }),
     []
@@ -218,14 +264,21 @@ function GradientMaterial() {
 
   useFrame((_, delta) => {
     const dt = Math.min(delta, 0.1);
-    material.uniforms.uTime.value  += dt * 0.06;
-    material.uniforms.uFlowX.value -= dt * 0.04;
+    material.uniforms.uTime.value += dt * 0.06;
+
+    // KEY FIX: oscillate instead of drift.
+    // Old code: uFlowX -= dt * 0.04  (unbounded — eventually blue dominates)
+    // New code: sin wave — always returns to center, all colors stay visible
+    material.uniforms.uFlowX.value =
+      Math.sin(material.uniforms.uTime.value * 0.8) * 0.15;
   });
 
   return <primitive object={material} attach="material" />;
 }
 
-// ─── Orb — no scale pulse, just the shader ────────────────────────────────────
+// ─── Orb ─────────────────────────────────────────────────────────────────────
+// High-res sphere (256×256 segments) so the shader has smooth UV gradients.
+// Fewer segments = visible faceting in the noise displacement.
 function ShaderOrb() {
   return (
     <mesh>
@@ -236,6 +289,8 @@ function ShaderOrb() {
 }
 
 // ─── Scene ────────────────────────────────────────────────────────────────────
+// Camera at z=3 with FOV 45 frames the orb tightly without perspective distortion.
+// Ambient light at full intensity (no shadows needed for a shader-driven surface).
 export function ShaderScene({ state = 'idle' }: ShaderSceneProps) {
   return (
     <Canvas camera={{ position: [0, 0, 3], fov: 45 }}>
